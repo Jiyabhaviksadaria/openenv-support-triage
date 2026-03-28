@@ -1,0 +1,123 @@
+name: customer-support-triage
+version: "1.0.0"
+description: >
+  An OpenEnv environment where AI agents learn to triage customer support tickets.
+  Agents must classify tickets by category, set urgency priority, route to the
+  correct team, compose professional responses, make escalation decisions, and
+  resolve tickets. Models a real-world task performed by support teams at scale.
+
+author: OpenEnv Hackathon Submission
+tags:
+  - openenv
+  - customer-support
+  - nlp
+  - triage
+  - real-world
+
+tasks:
+  - id: single_triage
+    name: Single Ticket Triage
+    difficulty: easy
+    description: Classify a single support ticket by category and priority.
+    max_steps: 5
+    score_range: [0.0, 1.0]
+
+  - id: queue_triage
+    name: Queue Triage (5 Tickets)
+    difficulty: medium
+    description: Process a mixed queue of 5 tickets — classify, prioritize, and route each.
+    max_steps: 20
+    score_range: [0.0, 1.0]
+
+  - id: full_resolution
+    name: Full Resolution Pipeline (3 Complex Tickets)
+    difficulty: hard
+    description: >
+      Handle 3 high-stakes tickets with full pipeline: classify, prioritize,
+      route, compose response, escalate if needed, and resolve. Tickets involve
+      production outages, security breaches, and enterprise SLA disputes.
+    max_steps: 30
+    score_range: [0.0, 1.0]
+
+observation_space:
+  type: object
+  fields:
+    task_id: string
+    task_description: string
+    step: integer
+    max_steps: integer
+    current_ticket:
+      type: object
+      fields:
+        id: string
+        subject: string
+        body: string
+        sender: string
+        timestamp: string
+        attachments: array[string]
+    queue_size: integer
+    processed_count: integer
+    ticket_states: object
+    available_actions: array[string]
+    done: boolean
+
+action_space:
+  type: object
+  fields:
+    action_type:
+      type: string
+      enum: [classify, set_priority, route, respond, escalate, resolve, skip]
+      required: true
+    ticket_id:
+      type: string
+      required: true
+    category:
+      type: string
+      enum: [billing, technical, account, general, security]
+      required_when: "action_type == classify"
+    priority:
+      type: string
+      enum: [low, medium, high, urgent]
+      required_when: "action_type == set_priority"
+    department:
+      type: string
+      enum: [billing_team, engineering, account_management, security_team, general_support]
+      required_when: "action_type == route"
+    response_text:
+      type: string
+      required_when: "action_type == respond"
+    resolution_notes:
+      type: string
+      required: false
+
+reward_space:
+  type: float
+  range: [-1.0, 1.0]
+  shaped: true
+  description: >
+    Step-level rewards for correct classification (+0.10), correct priority (+0.08),
+    correct routing (+0.08), response quality (up to +0.15), escalation accuracy (+0.05),
+    resolution (+0.05). Penalties for wrong actions (-0.05), skips (-0.08),
+    invalid actions (-0.03), and a per-step efficiency cost (-0.005).
+    Completion bonus +0.15 when all tickets are processed.
+
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  tasks: GET /tasks
+  grader: POST /grader
+  baseline: POST /baseline
+  health: GET /health
+
+deployment:
+  platform: huggingface-spaces
+  sdk: docker
+  port: 7860
+
+baseline_scores:
+  model: gpt-4o-mini
+  single_triage: 0.0000
+  queue_triage: 0.0000
+  full_resolution: 0.0000
+  overall: 0.0000

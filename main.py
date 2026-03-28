@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from pydantic import BaseModel
 from models import Action, GraderResponse, ResetResponse, StateResponse, StepResponse
 from environment import SupportTriageEnv
 from tasks import TASKS, TASKS_BY_ID
@@ -112,37 +113,45 @@ async def root():
     }
 
 
+class ResetRequest(BaseModel):
+    task_id: str = "single_triage"
+    seed: Optional[int] = None
+
 @app.post("/reset", response_model=ResetResponse)
 async def reset(
-    task_id: str = Query(default="single_triage", description="Task to run: single_triage | queue_triage | full_resolution"),
-    seed: Optional[int] = Query(default=None, description="Random seed (reserved for future use)"),
+    request: Optional[ResetRequest] = None,
+    task_id: Optional[str] = Query(default=None, description="Task to run"),
+    seed: Optional[int] = Query(default=None, description="Random seed"),
 ):
     """
     Start a new episode. Returns a session_id and initial observation.
     Pass session_id to /step and /state.
     """
-    if task_id not in TASKS_BY_ID:
+    actual_task_id = (request and request.task_id) or task_id or "single_triage"
+    actual_seed = (request and request.seed) or seed
+
+    if actual_task_id not in TASKS_BY_ID:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown task_id: {task_id!r}. Valid options: {list(TASKS_BY_ID.keys())}"
+            detail=f"Unknown task_id: {actual_task_id!r}. Valid options: {list(TASKS_BY_ID.keys())}"
         )
     _cleanup_sessions()
 
     session_id = str(uuid.uuid4())
-    env = SupportTriageEnv(task_id=task_id, seed=seed)
+    env = SupportTriageEnv(task_id=actual_task_id, seed=actual_seed)
     obs = env.reset()
 
     SESSIONS[session_id] = {
         "env": env,
-        "task_id": task_id,
+        "task_id": actual_task_id,
         "created_at": datetime.utcnow(),
     }
 
     return ResetResponse(
         session_id=session_id,
         observation=obs,
-        task_id=task_id,
-        task_description=TASKS_BY_ID[task_id]["description"],
+        task_id=actual_task_id,
+        task_description=TASKS_BY_ID[actual_task_id]["description"],
     )
 
 

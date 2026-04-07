@@ -103,28 +103,30 @@ def run_episode(
         print(f"Model: {model}", file=sys.stderr)
         print(f"{'='*60}", file=sys.stderr)
 
-    # Reset environment
-    reset_resp = _call_env("POST", f"/reset?task_id={task_id}")
-    session_id = reset_resp["session_id"]
-    obs = reset_resp["observation"]
-
     print(f"[START] task={task_id} env=OpenEnv model={model}")
 
-    messages: List[Dict] = []
     step_num = 0
-    done = False
     total_reward = 0.0
     rewards_list: List[float] = []
 
-    while not done:
-        step_num += 1
+    try:
+        # Reset environment
+        reset_resp = _call_env("POST", f"/reset?task_id={task_id}")
+        session_id = reset_resp["session_id"]
+        obs = reset_resp["observation"]
 
-        # Build user message from observation
-        current = obs.get("current_ticket")
-        if not current:
-            break
+        messages: List[Dict] = []
+        done = False
 
-        user_content = f"""Current Observation (Step {obs['step']}/{obs['max_steps']}):
+        while not done:
+            step_num += 1
+
+            # Build user message from observation
+            current = obs.get("current_ticket")
+            if not current:
+                break
+
+            user_content = f"""Current Observation (Step {obs['step']}/{obs['max_steps']}):
 
 Ticket ID: {current['id']}
 Subject: {current['subject']}
@@ -142,98 +144,113 @@ Task: {obs['task_description']}
 
 What is your next action? Output ONLY a JSON action object."""
 
+            if verbose:
+                print(f"\n[Step {step_num}] Ticket: {current['id']} — {current['subject'][:50]}", file=sys.stderr)
+
+            # Add to message history
+            messages.append({"role": "user", "content": user_content})
+
+            error_msg = "null"
+            # Call the LLM
+            for attempt in range(max_retries):
+                try:
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                        temperature=0.0,
+                        max_tokens=800,
+                    )
+                    raw = completion.choices[0].message.content.strip()
+
+                    # Parse JSON action
+                    if raw.startswith("```"):
+                        raw = raw.split("```")[1]
+                        if raw.startswith("json"):
+                            raw = raw[4:]
+                    action_data = json.loads(raw)
+                    break
+                except (json.JSONDecodeError, Exception) as e:
+                    if attempt == max_retries - 1:
+                        # Fall back to skip
+                        action_data = {"action_type": "skip", "ticket_id": current["id"]}
+                        error_msg = str(e).replace('\n', ' ')
+                        if verbose:
+                            print(f"  [!] LLM parse failed ({e}), defaulting to skip", file=sys.stderr)
+                    else:
+                        time.sleep(1)
+
+            if verbose:
+                print(f"  Action: {action_data.get('action_type')} | Category: {action_data.get('category')} | Priority: {action_data.get('priority')}", file=sys.stderr)
+
+            # Add assistant message to history
+            messages.append({"role": "assistant", "content": json.dumps(action_data)})
+
+            # Send action to environment
+            step_resp = _call_env(
+                "POST",
+                f"/step?session_id={session_id}",
+                json=action_data,
+            )
+
+            reward = step_resp["reward"]["total"]
+            total_reward += reward
+            rewards_list.append(reward)
+            done = step_resp["done"]
+            obs = step_resp["observation"]
+            
+            # Determine strict fields
+            err_str = error_msg if error_msg != "null" else "null"
+            act_str = json.dumps(action_data, separators=(',', ':'))
+            is_done_str = "true" if done else "false"
+            
+            print(f"[STEP] step={step_num} action={act_str} reward={reward:.2f} done={is_done_str} error={err_str}")
+
+            if verbose:
+                print(f"  Reward: {reward:+.4f} | {step_resp['reward']['message'][:80]}", file=sys.stderr)
+
+            # Reset messages for next ticket if we advanced
+            if obs.get("current_ticket") and obs["current_ticket"]["id"] != current["id"]:
+                messages = []  
+
+        # Grade the episode
+        grade_resp = _call_env("POST", f"/grader?session_id={session_id}")
+
         if verbose:
-            print(f"\n[Step {step_num}] Ticket: {current['id']} — {current['subject'][:50]}", file=sys.stderr)
-
-        # Add to message history
-        messages.append({"role": "user", "content": user_content})
-
-        error_msg = "null"
-        # Call the LLM
-        for attempt in range(max_retries):
-            try:
-                completion = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-                    temperature=0.0,
-                    max_tokens=800,
-                )
-                raw = completion.choices[0].message.content.strip()
-
-                # Parse JSON action
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                action_data = json.loads(raw)
-                break
-            except (json.JSONDecodeError, Exception) as e:
-                if attempt == max_retries - 1:
-                    # Fall back to skip
-                    action_data = {"action_type": "skip", "ticket_id": current["id"]}
-                    error_msg = str(e).replace('\n', ' ')
-                    if verbose:
-                        print(f"  [!] LLM parse failed ({e}), defaulting to skip", file=sys.stderr)
-                else:
-                    time.sleep(1)
-
-        if verbose:
-            print(f"  Action: {action_data.get('action_type')} | Category: {action_data.get('category')} | Priority: {action_data.get('priority')}", file=sys.stderr)
-
-        # Add assistant message to history
-        messages.append({"role": "assistant", "content": json.dumps(action_data)})
-
-        # Send action to environment
-        step_resp = _call_env(
-            "POST",
-            f"/step?session_id={session_id}",
-            json=action_data,
-        )
-
-        reward = step_resp["reward"]["total"]
-        total_reward += reward
-        rewards_list.append(reward)
-        done = step_resp["done"]
-        obs = step_resp["observation"]
+            print(f"\n{'─'*60}", file=sys.stderr)
+            print(f"Episode complete — Steps: {step_num} | Cumulative reward: {total_reward:.4f}", file=sys.stderr)
+            print(f"Grader score: {grade_resp['score']:.4f}", file=sys.stderr)
+            print(f"Feedback: {grade_resp['feedback']}", file=sys.stderr)
+            
+        score = grade_resp["score"]
+        success_str = "true" if score == 1.0 else "false"
+        rwds_str = ",".join([f"{r:.2f}" for r in rewards_list])
         
-        # Determine strict fields
-        err_str = error_msg if error_msg != "null" else "null"
-        act_str = json.dumps(action_data, separators=(',', ':'))
-        is_done_str = "true" if done else "false"
-        
-        print(f"[STEP] step={step_num} action={act_str} reward={reward:.2f} done={is_done_str} error={err_str}")
+        print(f"[END] success={success_str} steps={step_num} score={score:.2f} rewards={rwds_str}")
 
-        if verbose:
-            print(f"  Reward: {reward:+.4f} | {step_resp['reward']['message'][:80]}", file=sys.stderr)
-
-        # Reset messages for next ticket if we advanced
-        if obs.get("current_ticket") and obs["current_ticket"]["id"] != current["id"]:
-            messages = []  
-
-    # Grade the episode
-    grade_resp = _call_env("POST", f"/grader?session_id={session_id}")
-
-    if verbose:
-        print(f"\n{'─'*60}", file=sys.stderr)
-        print(f"Episode complete — Steps: {step_num} | Cumulative reward: {total_reward:.4f}", file=sys.stderr)
-        print(f"Grader score: {grade_resp['score']:.4f}", file=sys.stderr)
-        print(f"Feedback: {grade_resp['feedback']}", file=sys.stderr)
-        
-    score = grade_resp["score"]
-    success_str = "true" if score == 1.0 else "false"
-    rwds_str = ",".join([f"{r:.2f}" for r in rewards_list])
-    
-    print(f"[END] success={success_str} steps={step_num} score={score:.2f} rewards={rwds_str}")
-
-    return {
-        "task_id": task_id,
-        "model": model,
-        "steps": step_num,
-        "cumulative_reward": round(total_reward, 4),
-        "grader_score": score,
-        "grader_breakdown": grade_resp["breakdown"],
-        "feedback": grade_resp["feedback"],
-    }
+        return {
+            "task_id": task_id,
+            "model": model,
+            "steps": step_num,
+            "cumulative_reward": round(total_reward, 4),
+            "grader_score": score,
+            "grader_breakdown": grade_resp["breakdown"],
+            "feedback": grade_resp["feedback"],
+        }
+    except Exception as e:
+        print(f"Episode encountered unhandled exception: {e}", file=sys.stderr)
+        score = 0.0
+        success_str = "false"
+        rwds_str = ",".join([f"{r:.2f}" for r in rewards_list])
+        print(f"[END] success={success_str} steps={step_num} score={score:.2f} rewards={rwds_str}")
+        return {
+            "task_id": task_id,
+            "model": model,
+            "steps": step_num,
+            "cumulative_reward": round(total_reward, 4),
+            "grader_score": score,
+            "grader_breakdown": {},
+            "feedback": str(e),
+        }
 
 def run_baseline(
     api_key: Optional[str] = None,
@@ -241,13 +258,14 @@ def run_baseline(
     model: str = MODEL_NAME,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    api_key = api_key or HF_TOKEN
+    api_key = api_key or HF_TOKEN or "dummy_key"
     
-    if not api_key:
-        print("ERROR: HF_TOKEN or API_KEY not set", file=sys.stderr)
-        sys.exit(1)
+    try:
+        client = OpenAI(api_key=api_key, base_url=api_base_url or API_BASE_URL)
+    except Exception as e:
+        print(f"Failed to initialize OpenAI client: {e}", file=sys.stderr)
+        return {"error": str(e)}
 
-    client = OpenAI(api_key=api_key, base_url=api_base_url or API_BASE_URL)
     tasks = ["single_triage", "queue_triage", "full_resolution"]
     results = {}
 
@@ -291,19 +309,17 @@ if __name__ == "__main__":
     if args.base_url:
         BASE_URL = args.base_url
 
-    api_key = HF_TOKEN
-    if not api_key:
-        print("ERROR: Set HF_TOKEN or API_KEY environment variable", file=sys.stderr)
-        sys.exit(1)
-
-    client = OpenAI(api_key=api_key, base_url=API_BASE_URL)
+    api_key = HF_TOKEN or "dummy_key"
 
     if args.task:
         try:
+            client = OpenAI(api_key=api_key, base_url=API_BASE_URL)
             result = run_episode(client, args.task, model=args.model, verbose=not args.quiet)
             print(json.dumps(result, indent=2), file=sys.stderr)
         except Exception as e:
             print(f"Error running episode: {e}", file=sys.stderr)
+            print(f"[START] task={args.task} env=OpenEnv model={args.model}")
+            print(f"[END] success=false steps=0 score=0.00 rewards=")
             print(json.dumps({"error": str(e), "grader_score": 0.0}, indent=2), file=sys.stderr)
             sys.exit(0)
     else:

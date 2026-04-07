@@ -2,12 +2,9 @@
 Baseline Inference Script — Customer Support Triage OpenEnv
 ============================================================
 Runs a GPT-4o-mini agent against all 3 tasks using the OpenAI API client.
-Reads credentials from OPENAI_API_KEY env var.
 
 Usage:
-    python baseline.py
-
-Or from the /baseline endpoint (runs automatically).
+    python inference.py
 
 Baseline Results (gpt-4o-mini, seed=42):
   single_triage:   ~0.85
@@ -22,19 +19,18 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-# ── OpenAI client ──────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
 except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai")
+    print("ERROR: openai package not installed. Run: pip install openai", file=sys.stderr)
     sys.exit(1)
 
-# ── Environment client ────────────────────────────────────────────────────────
 import requests
 
 BASE_URL = os.environ.get("OPENENV_BASE_URL", "http://localhost:7860")
-
-# ── System prompt ──────────────────────────────────────────────────────────────
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY")
 
 SYSTEM_PROMPT = """You are an expert customer support manager AI agent operating in an OpenEnv environment.
 
@@ -72,7 +68,6 @@ Priority guidelines:
 
 Always respond with ONLY the JSON object. No markdown, no explanation."""
 
-
 def _call_env(method: str, path: str, **kwargs) -> Dict:
     """Make an HTTP call to the OpenEnv server."""
     url = f"{BASE_URL}{path}"
@@ -90,37 +85,36 @@ def _call_env(method: str, path: str, **kwargs) -> Dict:
         except (requests.exceptions.RequestException, ValueError) as e:
             if attempt == max_retries - 1:
                 print(f"Network error calling {url}: {e}", file=sys.stderr)
-                # Re-raise or return empty depending on requirement. The rubric says "unhandled exception",
-                # maybe we should not crash here either? Wait, if we return dummy data when the environment is fully down,
-                # we fail gracefully. But let's re-raise it, since we'll catch it in __main__
                 raise
             time.sleep(2)
-
 
 def run_episode(
     client: OpenAI,
     task_id: str,
-    model: str = "gpt-4o-mini",
+    model: str,
     max_retries: int = 3,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """Run a full episode for a given task. Returns grader result."""
 
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"Task: {task_id}")
-        print(f"Model: {model}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"Task: {task_id}", file=sys.stderr)
+        print(f"Model: {model}", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
 
     # Reset environment
     reset_resp = _call_env("POST", f"/reset?task_id={task_id}")
     session_id = reset_resp["session_id"]
     obs = reset_resp["observation"]
 
+    print(f"[START] task={task_id} env=OpenEnv model={model}")
+
     messages: List[Dict] = []
     step_num = 0
     done = False
     total_reward = 0.0
+    rewards_list: List[float] = []
 
     while not done:
         step_num += 1
@@ -149,11 +143,12 @@ Task: {obs['task_description']}
 What is your next action? Output ONLY a JSON action object."""
 
         if verbose:
-            print(f"\n[Step {step_num}] Ticket: {current['id']} — {current['subject'][:50]}")
+            print(f"\n[Step {step_num}] Ticket: {current['id']} — {current['subject'][:50]}", file=sys.stderr)
 
         # Add to message history
         messages.append({"role": "user", "content": user_content})
 
+        error_msg = "null"
         # Call the LLM
         for attempt in range(max_retries):
             try:
@@ -166,7 +161,6 @@ What is your next action? Output ONLY a JSON action object."""
                 raw = completion.choices[0].message.content.strip()
 
                 # Parse JSON action
-                # Strip markdown code fences if present
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
                     if raw.startswith("json"):
@@ -177,13 +171,14 @@ What is your next action? Output ONLY a JSON action object."""
                 if attempt == max_retries - 1:
                     # Fall back to skip
                     action_data = {"action_type": "skip", "ticket_id": current["id"]}
+                    error_msg = str(e).replace('\n', ' ')
                     if verbose:
-                        print(f"  [!] LLM parse failed ({e}), defaulting to skip")
+                        print(f"  [!] LLM parse failed ({e}), defaulting to skip", file=sys.stderr)
                 else:
                     time.sleep(1)
 
         if verbose:
-            print(f"  Action: {action_data.get('action_type')} | Category: {action_data.get('category')} | Priority: {action_data.get('priority')}")
+            print(f"  Action: {action_data.get('action_type')} | Category: {action_data.get('category')} | Priority: {action_data.get('priority')}", file=sys.stderr)
 
         # Add assistant message to history
         messages.append({"role": "assistant", "content": json.dumps(action_data)})
@@ -197,50 +192,62 @@ What is your next action? Output ONLY a JSON action object."""
 
         reward = step_resp["reward"]["total"]
         total_reward += reward
+        rewards_list.append(reward)
         done = step_resp["done"]
         obs = step_resp["observation"]
+        
+        # Determine strict fields
+        err_str = error_msg if error_msg != "null" else "null"
+        act_str = json.dumps(action_data, separators=(',', ':'))
+        is_done_str = "true" if done else "false"
+        
+        print(f"[STEP] step={step_num} action={act_str} reward={reward:.2f} done={is_done_str} error={err_str}")
 
         if verbose:
-            print(f"  Reward: {reward:+.4f} | {step_resp['reward']['message'][:80]}")
+            print(f"  Reward: {reward:+.4f} | {step_resp['reward']['message'][:80]}", file=sys.stderr)
 
         # Reset messages for next ticket if we advanced
         if obs.get("current_ticket") and obs["current_ticket"]["id"] != current["id"]:
-            messages = []  # Fresh context for each ticket
+            messages = []  
 
     # Grade the episode
     grade_resp = _call_env("POST", f"/grader?session_id={session_id}")
 
     if verbose:
-        print(f"\n{'─'*60}")
-        print(f"Episode complete — Steps: {step_num} | Cumulative reward: {total_reward:.4f}")
-        print(f"Grader score: {grade_resp['score']:.4f}")
-        print(f"Feedback: {grade_resp['feedback']}")
+        print(f"\n{'─'*60}", file=sys.stderr)
+        print(f"Episode complete — Steps: {step_num} | Cumulative reward: {total_reward:.4f}", file=sys.stderr)
+        print(f"Grader score: {grade_resp['score']:.4f}", file=sys.stderr)
+        print(f"Feedback: {grade_resp['feedback']}", file=sys.stderr)
+        
+    score = grade_resp["score"]
+    success_str = "true" if score == 1.0 else "false"
+    rwds_str = ",".join([f"{r:.2f}" for r in rewards_list])
+    
+    print(f"[END] success={success_str} steps={step_num} score={score:.2f} rewards={rwds_str}")
 
     return {
         "task_id": task_id,
         "model": model,
         "steps": step_num,
         "cumulative_reward": round(total_reward, 4),
-        "grader_score": grade_resp["score"],
+        "grader_score": score,
         "grader_breakdown": grade_resp["breakdown"],
         "feedback": grade_resp["feedback"],
     }
 
-
 def run_baseline(
     api_key: Optional[str] = None,
-    model: str = "gpt-4o-mini",
+    api_base_url: Optional[str] = None,
+    model: str = MODEL_NAME,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Run baseline agent against all 3 tasks.
-    Returns dict with per-task scores and overall average.
-    """
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
+    api_key = api_key or HF_TOKEN
+    
     if not api_key:
-        raise ValueError("OPENAI_API_KEY not set")
+        print("ERROR: HF_TOKEN or API_KEY not set", file=sys.stderr)
+        sys.exit(1)
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=api_base_url or API_BASE_URL)
     tasks = ["single_triage", "queue_triage", "full_resolution"]
     results = {}
 
@@ -262,51 +269,48 @@ def run_baseline(
     }
 
     if verbose:
-        print(f"\n{'='*60}")
-        print("BASELINE SUMMARY")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", file=sys.stderr)
+        print("BASELINE SUMMARY", file=sys.stderr)
+        print(f"{'='*60}", file=sys.stderr)
         for task, score in summary["scores"].items():
-            print(f"  {task}: {score:.4f}")
-        print(f"  OVERALL: {overall:.4f}")
+            print(f"  {task}: {score:.4f}", file=sys.stderr)
+        print(f"  OVERALL: {overall:.4f}", file=sys.stderr)
 
     return summary
-
-
-# ── CLI entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run baseline inference for the Support Triage OpenEnv")
-    parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model to use")
+    parser.add_argument("--model", default=MODEL_NAME, help="OpenAI model to use")
     parser.add_argument("--task", default=None, help="Run single task only (single_triage|queue_triage|full_resolution)")
-    parser.add_argument("--base-url", default="http://localhost:7860", help="OpenEnv server URL")
+    parser.add_argument("--base-url", default=BASE_URL, help="OpenEnv server URL")
     parser.add_argument("--quiet", action="store_true", help="Suppress step-by-step output")
     args = parser.parse_args()
 
     if args.base_url:
         BASE_URL = args.base_url
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = HF_TOKEN
     if not api_key:
-        print("ERROR: Set OPENAI_API_KEY environment variable")
+        print("ERROR: Set HF_TOKEN or API_KEY environment variable", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=API_BASE_URL)
 
     if args.task:
         try:
             result = run_episode(client, args.task, model=args.model, verbose=not args.quiet)
-            print(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2), file=sys.stderr)
         except Exception as e:
             print(f"Error running episode: {e}", file=sys.stderr)
-            print(json.dumps({"error": str(e), "grader_score": 0.0}, indent=2))
+            print(json.dumps({"error": str(e), "grader_score": 0.0}, indent=2), file=sys.stderr)
             sys.exit(0)
     else:
         try:
-            summary = run_baseline(api_key=api_key, model=args.model, verbose=not args.quiet)
-            print(json.dumps(summary, indent=2))
+            summary = run_baseline(api_key=api_key, api_base_url=API_BASE_URL, model=args.model, verbose=not args.quiet)
+            print(json.dumps(summary, indent=2), file=sys.stderr)
         except Exception as e:
             print(f"Error running baseline: {e}", file=sys.stderr)
-            print(json.dumps({"error": str(e), "overall_average": 0.0}, indent=2))
+            print(json.dumps({"error": str(e), "overall_average": 0.0}, indent=2), file=sys.stderr)
             sys.exit(0)

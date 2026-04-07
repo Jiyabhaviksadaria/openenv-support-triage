@@ -22,10 +22,14 @@ from typing import Any, Dict, List, Optional
 try:
     from openai import OpenAI
 except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai", file=sys.stderr)
-    sys.exit(1)
+    OpenAI = None
+    print("WARNING: openai package not installed.", file=sys.stderr)
 
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None
+    print("WARNING: requests package not installed.", file=sys.stderr)
 
 BASE_URL = os.environ.get("OPENENV_BASE_URL", "http://localhost:7860")
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")

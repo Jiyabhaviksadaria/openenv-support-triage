@@ -6,71 +6,63 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+# ── SET THESE (IMPORTANT) ─────────────────────────────────────────────────────
+BASE_URL = os.environ.get(
+    "OPENENV_BASE_URL",
+    "https://jiyasadaria2-openenv-support-triage.hf.space"
+)
 
-# ── Safe imports ──────────────────────────────────────────────────────────────
-OpenAI = None
-requests = None
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or "dummy_key"
+)
+
+print("DEBUG BASE_URL:", BASE_URL, file=sys.stderr)
+print("DEBUG TOKEN:", HF_TOKEN[:10], file=sys.stderr)
+
+# ── Imports ───────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
-except Exception:
-    pass
+except:
+    OpenAI = None
 
 try:
-    import requests as _requests
-    requests = _requests
-except Exception:
-    pass
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-BASE_URL = os.environ.get("OPENENV_BASE_URL", "http://localhost:7860")
-
-API_BASE_URL = os.environ.get(
-    "API_BASE_URL",
-    "https://router.huggingface.co/v1"
-)
-
-MODEL_NAME = os.environ.get(
-    "MODEL_NAME",
-    "Qwen/Qwen2.5-72B-Instruct"
-)
-
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY") or "dummy_key"
-
-print("DEBUG API:", API_BASE_URL, file=sys.stderr)
-
-# ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert customer support manager AI agent.
-
-Always respond ONLY with valid JSON.
-"""
+    import requests
+except:
+    requests = None
 
 # ── Safe API call ─────────────────────────────────────────────────────────────
 def _call_env(method: str, path: str, **kwargs) -> Dict:
     if requests is None:
-        print("[ERROR] requests not installed", file=sys.stderr)
-        return {"error": "requests_not_available"}
+        return {"error": "requests_missing"}
 
-    url = f"{BASE_URL}{path}"
+    if not BASE_URL:
+        return {"error": "missing_base_url"}
+
+    url = BASE_URL + path
 
     for attempt in range(3):
         try:
             if method == "GET":
-                resp = requests.get(url, timeout=20, **kwargs)
+                res = requests.get(url, timeout=15)
             else:
-                resp = requests.post(url, timeout=20, **kwargs)
+                res = requests.post(url, timeout=15, **kwargs)
 
-            resp.raise_for_status()
-            return resp.json()
+            return res.json()
 
         except Exception as e:
-            print(f"[Retry {attempt+1}] {e}", file=sys.stderr)
+            print(f"[ENV RETRY {attempt+1}] {e}", file=sys.stderr)
             time.sleep(1)
 
     return {"error": "env_failed"}
 
 # ── Main logic ────────────────────────────────────────────────────────────────
-def run_episode(client: Any, task_id: str, model: str) -> Dict:
+def run_episode(client: Any, task_id: str, model: str):
 
     print(f"[START] task={task_id} env=OpenEnv model={model}", flush=True)
 
@@ -78,15 +70,16 @@ def run_episode(client: Any, task_id: str, model: str) -> Dict:
         reset_resp = _call_env("POST", f"/reset?task_id={task_id}")
 
         if "session_id" not in reset_resp:
-            raise RuntimeError(f"Bad response: {reset_resp}")
+            print("[RESET ERROR]", reset_resp, file=sys.stderr)
+            print("[END] success=false steps=0 score=0 rewards=", flush=True)
+            return
 
         session_id = reset_resp["session_id"]
-        obs = reset_resp["observation"]
+        obs = reset_resp.get("observation", {})
 
-        done = False
         step_num = 0
 
-        while not done:
+        while True:
             step_num += 1
 
             current = obs.get("current_ticket")
@@ -95,7 +88,7 @@ def run_episode(client: Any, task_id: str, model: str) -> Dict:
 
             action_data = {
                 "action_type": "skip",
-                "ticket_id": current["id"]
+                "ticket_id": current.get("id", "0")
             }
 
             error_msg = "null"
@@ -105,7 +98,7 @@ def run_episode(client: Any, task_id: str, model: str) -> Dict:
                 try:
                     completion = client.chat.completions.create(
                         model=model,
-                        messages=[{"role": "user", "content": "Respond in JSON"}],
+                        messages=[{"role": "user", "content": "Return valid JSON"}],
                         max_tokens=200
                     )
 
@@ -122,7 +115,7 @@ def run_episode(client: Any, task_id: str, model: str) -> Dict:
             else:
                 error_msg = "no_client"
 
-            # ── Step call ────────────────────────────
+            # ── STEP CALL ────────────────────────────
             step_resp = _call_env(
                 "POST",
                 f"/step?session_id={session_id}",
@@ -133,37 +126,31 @@ def run_episode(client: Any, task_id: str, model: str) -> Dict:
             done = bool(step_resp.get("done", True))
             obs = step_resp.get("observation", {})
 
-            done_str = "true" if done else "false"
-            act_str = json.dumps(action_data, separators=(',', ':'))
             print(
-                f"[STEP] step={step_num} action={act_str} "
-                f"reward={reward:.2f} done={done_str} error={error_msg}",
+                f"[STEP] step={step_num} action={json.dumps(action_data)} "
+                f"reward={reward:.2f} done={'true' if done else 'false'} error={error_msg}",
                 flush=True,
             )
 
-        # Grade the episode
+            if done:
+                break
+
+        # ── GRADER ────────────────────────────────
         grade_resp = _call_env("POST", f"/grader?session_id={session_id}")
         score = float(grade_resp.get("score", 0.0))
-        success_str = "true" if score >= 0.5 else "false"
 
         print(
-            f"[END] success={success_str} steps={step_num} score={score:.2f} rewards=0.00",
+            f"[END] success={'true' if score >= 0.5 else 'false'} "
+            f"steps={step_num} score={score:.2f} rewards=0.00",
             flush=True,
         )
-
-        return {"status": "done", "score": score}
 
     except Exception as e:
         import traceback
-        print("[ERROR]", e, file=sys.stderr)
+        print("[FATAL ERROR]", e, file=sys.stderr)
         traceback.print_exc()
 
-        print(
-            f"[END] success=false steps=0 score=0.0 rewards=",
-            flush=True,
-        )
-
-        return {"error": str(e)}
+        print("[END] success=false steps=0 score=0 rewards=", flush=True)
 
 # ── Runner ───────────────────────────────────────────────────────────────────
 def run():
@@ -171,12 +158,9 @@ def run():
 
     if OpenAI:
         try:
-            client = OpenAI(
-                api_key=HF_TOKEN,
-                base_url=API_BASE_URL
-            )
+            client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
         except Exception as e:
-            print("Client init failed:", e, file=sys.stderr)
+            print("[CLIENT ERROR]", e, file=sys.stderr)
 
     tasks = ["single_triage", "queue_triage", "full_resolution"]
 
@@ -185,5 +169,10 @@ def run():
 
 # ── Entry ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception as e:
+        print("[CRASH PREVENTED]", e, file=sys.stderr)
+        print("[END] success=false steps=0 score=0 rewards=", flush=True)
+
     sys.exit(0)

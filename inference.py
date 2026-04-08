@@ -177,7 +177,8 @@ def run_episode(client: Any, task_id: str, model: str) -> None:
     try:
         reset_resp = _call_env("POST", f"/reset?task_id={task_id}")
         if "session_id" not in reset_resp:
-            raise RuntimeError(f"Reset failed: {reset_resp}")
+            print(f"[WARN] Reset failed for {task_id}: {reset_resp}", file=sys.stderr)
+            return  # finally block will emit [END]
 
         session_id = reset_resp["session_id"]
         obs = reset_resp.get("observation", {})

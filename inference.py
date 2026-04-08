@@ -6,17 +6,27 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-# ── SET THESE (IMPORTANT) ─────────────────────────────────────────────────────
+# ── SET YOUR TOKEN (⚠️ REMOVE LATER FOR SECURITY) ─────────────────────────────
+os.environ["HF_TOKEN"] = "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"
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 BASE_URL = os.environ.get(
     "OPENENV_BASE_URL",
     "https://jiyasadaria2-openenv-support-triage.hf.space"
 )
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_BASE_URL = os.environ.get(
+    "API_BASE_URL",
+    "https://router.huggingface.co/v1"
+)
+
+MODEL_NAME = os.environ.get(
+    "MODEL_NAME",
+    "Qwen/Qwen2.5-72B-Instruct"
+)
 
 HF_TOKEN = (
-    os.environ.get("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")
+    os.environ.get("HF_TOKEN")
     or os.environ.get("API_KEY")
     or os.environ.get("OPENAI_API_KEY")
     or "dummy_key"
